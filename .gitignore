@@ -1,0 +1,6 @@
+essay_bank/
+_cache/
+*.pyc
+__pycache__/
+_collector_progress.json
+_logs/
