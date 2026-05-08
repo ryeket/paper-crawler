@@ -46,6 +46,33 @@ S2_BATCH_SIZE = 2  # S2 每批 2 个搜索词
 ARXIV_BATCH_SIZE = 3  # arXiv 每批 3 个搜索词
 
 # ═══════════════════════════════════════════════════════════════
+# 摘要质量验证
+# ═══════════════════════════════════════════════════════════════
+
+MIN_ABSTRACT_LEN = 150  # 短于 150 字视为不完整
+
+
+def verify_abstract(abstract: str) -> str:
+    """检查摘要质量。返回 'ok', 'short', 'truncated', 'empty'。"""
+    text = (abstract or "").strip()
+    if not text or len(text) < 10:
+        return "empty"
+    # 截断检测：非正常句子结尾
+    truncated_endings = (",", ";", ":", "-", "—", "and", "or", "of", "to", "in", "for", "with", "the", "a")
+    words = text.split()
+    if words and words[-1].lower().rstrip(")") in truncated_endings:
+        return "truncated"
+    if len(text) < MIN_ABSTRACT_LEN:
+        # 非常短的摘要，可能被截断
+        if text[-1] not in ".!?\"'»」』”":
+            return "truncated"
+        return "short"
+    if text[-1] not in ".!?\"'»」』”":
+        return "truncated"
+    return "ok"
+
+
+# ═══════════════════════════════════════════════════════════════
 # 搜索词条
 # ═══════════════════════════════════════════════════════════════
 
@@ -380,6 +407,41 @@ class OASource(KnowledgeSource):
 
         return results_all
 
+    def _enrich_abstracts(self, items: dict[str, dict]):
+        """批量补全摘要 — 搜索接口截断到 ~250 词，filter-by-ID 接口返回全文。
+        以 50 篇为一批请求，仅补全被截断或过短的摘要。"""
+        need_enrich = {
+            wid: item for wid, item in items.items()
+            if verify_abstract(item.get("abstract", "")) != "ok"
+        }
+        if not need_enrich:
+            return
+        ids = list(need_enrich.keys())
+        enriched = 0
+        for batch_start in range(0, len(ids), 50):
+            batch_ids = ids[batch_start:batch_start + 50]
+            id_filter = "|".join(f"https://openalex.org/{oid}" for oid in batch_ids)
+            url = (
+                f"https://api.openalex.org/works"
+                f"?filter=openalex_id:{requests.utils.quote(id_filter)}"
+                f"&per_page=50"
+                f"&select=id,abstract_inverted_index"
+            )
+            time.sleep(OA_REQ_INTERVAL)
+            data = self._api_get(url)
+            if not data:
+                continue
+            for work in data.get("results", []):
+                wid = str(work.get("id", "")).split("/")[-1]
+                inv = work.get("abstract_inverted_index")
+                if inv and wid in items:
+                    full = self._invert_abstract(inv)
+                    if len(full) > len(items[wid].get("abstract", "")):
+                        items[wid]["abstract"] = full
+                        enriched += 1
+        if enriched:
+            print(f"    [补全摘要] {enriched}/{len(ids)} 篇")
+
     def fetch_batch(self, terms: list[str]) -> list[dict]:
         all_items: dict[str, dict] = {}
         for kw in terms:
@@ -393,6 +455,8 @@ class OASource(KnowledgeSource):
                 oid = self.item_id(item)
                 if oid not in all_items:
                     all_items[oid] = item
+        if all_items:
+            self._enrich_abstracts(all_items)
         items = list(all_items.values())
         items.sort(key=lambda x: x.get("cited_by_count", 0) or 0, reverse=True)
         return items
@@ -435,6 +499,7 @@ class OASource(KnowledgeSource):
         done = load_done_set(self.metadata_path)
         success = fail = skip = 0
         total = len(items)
+        q_empty = q_trunc = q_short = q_ok = 0
 
         for idx, item in enumerate(items, 1):
             iid = self.item_id(item)
@@ -474,6 +539,17 @@ class OASource(KnowledgeSource):
                     pass
                 continue
 
+            # 质量验证
+            q = verify_abstract(item.get("abstract", ""))
+            if q == "empty":
+                q_empty += 1
+            elif q == "truncated":
+                q_trunc += 1
+            elif q == "short":
+                q_short += 1
+            else:
+                q_ok += 1
+
             out_name = self.make_filename(item)
             out_path = self.output_dir / out_name
             out_path.write_text(out_name + "\n\n" + text, encoding="utf-8")
@@ -495,7 +571,15 @@ class OASource(KnowledgeSource):
             if idx % 200 == 0:
                 print(f"    [{idx}/{total}] +{success} x{fail} ~{skip}")
 
-        print(f"    批次完成: +{success} x{fail} ~{skip}")
+        parts = [f"+{success} x{fail} ~{skip}"]
+        if q_trunc:
+            parts.append(f"⚠截断{q_trunc}")
+        if q_short:
+            parts.append(f"短{q_short}")
+        if q_empty:
+            parts.append(f"空{q_empty}")
+        parts.append(f"✓{q_ok}")
+        print(f"    批次完成: {' | '.join(parts)}")
         return success, fail, skip
 
 
@@ -657,6 +741,7 @@ class S2Source(KnowledgeSource):
         done = load_done_set(self.metadata_path)
         success = fail = skip = 0
         total = len(items)
+        q_empty = q_trunc = q_short = q_ok = 0
         for idx, item in enumerate(items, 1):
             iid = self.item_id(item)
             if iid in done:
@@ -686,6 +771,11 @@ class S2Source(KnowledgeSource):
                 except Exception:
                     pass
                 continue
+            q = verify_abstract(item.get("abstract", "") or item.get("tldr", ""))
+            if q == "empty": q_empty += 1
+            elif q == "truncated": q_trunc += 1
+            elif q == "short": q_short += 1
+            else: q_ok += 1
             out_name = self.make_filename(item)
             (self.output_dir / out_name).write_text(out_name + "\n\n" + text, encoding="utf-8")
             try:
@@ -701,7 +791,12 @@ class S2Source(KnowledgeSource):
             done.add(iid)
             if idx % 50 == 0:
                 print(f"    [{idx}/{total}] +{success} x{fail} ~{skip}")
-        print(f"    批次完成: +{success} x{fail} ~{skip}")
+        parts = [f"+{success} x{fail} ~{skip}"]
+        if q_trunc: parts.append(f"⚠截断{q_trunc}")
+        if q_short: parts.append(f"短{q_short}")
+        if q_empty: parts.append(f"空{q_empty}")
+        parts.append(f"✓{q_ok}")
+        print(f"    批次完成: {' | '.join(parts)}")
         return success, fail, skip
 
 
@@ -840,6 +935,7 @@ class ArxivSource(KnowledgeSource):
         done = load_done_set(self.metadata_path)
         success = fail = skip = 0
         total = len(items)
+        q_empty = q_trunc = q_short = q_ok = 0
         for idx, item in enumerate(items, 1):
             iid = self.item_id(item)
             if iid in done:
@@ -869,6 +965,11 @@ class ArxivSource(KnowledgeSource):
                 except Exception:
                     pass
                 continue
+            q = verify_abstract(item.get("summary", ""))
+            if q == "empty": q_empty += 1
+            elif q == "truncated": q_trunc += 1
+            elif q == "short": q_short += 1
+            else: q_ok += 1
             out_name = self.make_filename(item)
             (self.output_dir / out_name).write_text(out_name + "\n\n" + text, encoding="utf-8")
             try:
@@ -884,7 +985,12 @@ class ArxivSource(KnowledgeSource):
             done.add(iid)
             if idx % 200 == 0:
                 print(f"    [{idx}/{total}] +{success} x{fail} ~{skip}")
-        print(f"    批次完成: +{success} x{fail} ~{skip}")
+        parts = [f"+{success} x{fail} ~{skip}"]
+        if q_trunc: parts.append(f"⚠截断{q_trunc}")
+        if q_short: parts.append(f"短{q_short}")
+        if q_empty: parts.append(f"空{q_empty}")
+        parts.append(f"✓{q_ok}")
+        print(f"    批次完成: {' | '.join(parts)}")
         return success, fail, skip
 
 
