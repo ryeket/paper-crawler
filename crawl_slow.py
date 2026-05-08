@@ -407,40 +407,46 @@ class OASource(KnowledgeSource):
 
         return results_all
 
-    def _enrich_abstracts(self, items: dict[str, dict]):
-        """批量补全摘要 — 搜索接口截断到 ~250 词，filter-by-ID 接口返回全文。
-        以 50 篇为一批请求，仅补全被截断或过短的摘要。"""
-        need_enrich = {
+    def _fill_from_s2(self, items: dict[str, dict]):
+        """用 Semantic Scholar 补全 OpenAlex 的空摘要。
+        仅对空摘要（非短/截断）做标题搜索，S2 摘要质量通常更高。"""
+        need_fill = {
             wid: item for wid, item in items.items()
-            if verify_abstract(item.get("abstract", "")) != "ok"
+            if not (item.get("abstract") or "").strip()
         }
-        if not need_enrich:
+        if not need_fill:
             return
-        ids = list(need_enrich.keys())
-        enriched = 0
-        for batch_start in range(0, len(ids), 50):
-            batch_ids = ids[batch_start:batch_start + 50]
-            id_filter = "|".join(f"https://openalex.org/{oid}" for oid in batch_ids)
-            url = (
-                f"https://api.openalex.org/works"
-                f"?filter=openalex_id:{requests.utils.quote(id_filter)}"
-                f"&per_page=50"
-                f"&select=id,abstract_inverted_index"
-            )
-            time.sleep(OA_REQ_INTERVAL)
-            data = self._api_get(url)
-            if not data:
+        filled = 0
+        s2_session = requests.Session()
+        s2_session.headers.update({"User-Agent": "PaperCrawler/1.0"})
+        for wid, item in list(need_fill.items())[:20]:  # 每批最多 20 次 S2 搜索
+            title = item.get("title", "")
+            if not title:
                 continue
-            for work in data.get("results", []):
-                wid = str(work.get("id", "")).split("/")[-1]
-                inv = work.get("abstract_inverted_index")
-                if inv and wid in items:
-                    full = self._invert_abstract(inv)
-                    if len(full) > len(items[wid].get("abstract", "")):
-                        items[wid]["abstract"] = full
-                        enriched += 1
-        if enriched:
-            print(f"    [补全摘要] {enriched}/{len(ids)} 篇")
+            try:
+                time.sleep(1.0)  # S2 未认证限速 ~1/s
+                params = {"query": title[:200], "limit": 3, "fields": "title,abstract"}
+                r = s2_session.get("https://api.semanticscholar.org/graph/v1/paper/search",
+                                   params=params, timeout=30)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                for paper in data.get("data", []):
+                    s2_title = (paper.get("title") or "").lower().strip()
+                    oa_title = title.lower().strip()
+                    # 标题相似度简单判断：至少 60% 字符重叠
+                    common = len(set(s2_title) & set(oa_title))
+                    if common < min(len(s2_title), len(oa_title)) * 0.5:
+                        continue
+                    s2_abstract = (paper.get("abstract") or "").strip()
+                    if len(s2_abstract) > 150:
+                        items[wid]["abstract"] = s2_abstract
+                        filled += 1
+                    break
+            except Exception:
+                continue
+        if filled:
+            print(f"    [S2补全] {filled}/{len(need_fill)} 篇")
 
     def fetch_batch(self, terms: list[str]) -> list[dict]:
         all_items: dict[str, dict] = {}
@@ -456,7 +462,7 @@ class OASource(KnowledgeSource):
                 if oid not in all_items:
                     all_items[oid] = item
         if all_items:
-            self._enrich_abstracts(all_items)
+            self._fill_from_s2(all_items)
         items = list(all_items.values())
         items.sort(key=lambda x: x.get("cited_by_count", 0) or 0, reverse=True)
         return items
